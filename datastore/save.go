@@ -74,7 +74,16 @@ func saveStructProperty(props *[]Property, name string, noIndex bool, v reflect.
 			if err != nil {
 				return fmt.Errorf("datastore: unsupported struct field: %v", err)
 			}
-			return sub.(structPLS).save(props, name, noIndex)
+			var subProps []Property
+			err = sub.(structPLS).save(&subProps, "", noIndex)
+			if err != nil {
+				return err
+			}
+			p.Value = subProps
+		case reflect.Ptr:
+			if !v.IsNil() {
+				return saveStructProperty(props, name, noIndex, v.Elem())
+			}
 		}
 	}
 	if p.Value == nil {
@@ -233,6 +242,14 @@ func interfaceToProto(iv interface{}, noIndex bool) (*pb.Value, error) {
 			return nil, errors.New("[]byte property too long to index")
 		}
 		val.ValueType = &pb.Value_BlobValue{v}
+	case []Property:
+		e, err := propertiesToProto(nil, v)
+		if err != nil {
+			return nil, err
+		}
+		val.ValueType = &pb.Value_EntityValue{
+			EntityValue: e,
+		}
 	case []interface{}:
 		arr := make([]*pb.Value, 0, len(v))
 		for i, v := range v {
