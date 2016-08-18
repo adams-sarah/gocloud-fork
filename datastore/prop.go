@@ -43,6 +43,7 @@ type Property struct {
 	//	- time.Time
 	//	- GeoPoint
 	//	- []byte (up to 1 megabyte in length)
+	//  - []Property (representing an embedded struct)
 	// Value can also be:
 	//	- []interface{} where each element is one of the above types
 	// This set is smaller than the set of valid struct field types that the
@@ -216,9 +217,6 @@ func getStructCodecLocked(t reflect.Type) (ret *structCodec, retErr error) {
 		}
 
 		if substructType != nil && substructType != typeOfTime && substructType != typeOfGeoPoint {
-			if name != "" {
-				name = name + "."
-			}
 			sub, err := getStructCodecLocked(substructType)
 			if err != nil {
 				return nil, err
@@ -231,13 +229,10 @@ func getStructCodecLocked(t reflect.Type) (ret *structCodec, retErr error) {
 					"datastore: flattening nested structs leads to a slice of slices: field %q", f.Name)
 			}
 			c.hasSlice = c.hasSlice || sub.hasSlice
-			for relName := range sub.byName {
-				absName := name + relName
-				if _, ok := c.byName[absName]; ok {
-					return nil, fmt.Errorf("datastore: struct tag has repeated property name: %q", absName)
-				}
-				c.byName[absName] = fieldCodec{index: i, substructCodec: sub}
+			if _, ok := c.byName[name]; ok {
+				return nil, fmt.Errorf("datastore: struct tag has repeated property name: %q", name)
 			}
+			c.byName[name] = fieldCodec{index: i, substructCodec: sub}
 		} else {
 			if _, ok := c.byName[name]; ok {
 				return nil, fmt.Errorf("datastore: struct tag has repeated property name: %q", name)
