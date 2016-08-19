@@ -74,7 +74,16 @@ func saveStructProperty(props *[]Property, name string, noIndex bool, v reflect.
 			if err != nil {
 				return fmt.Errorf("datastore: unsupported struct field: %v", err)
 			}
-			return sub.(structPLS).save(props, name, noIndex)
+			var subProps []Property
+			err = sub.(structPLS).save(&subProps, noIndex)
+			if err != nil {
+				return err
+			}
+			p.Value = subProps
+		case reflect.Ptr:
+			if !v.IsNil() {
+				return saveStructProperty(props, name, noIndex, v.Elem())
+			}
 		}
 	}
 	if p.Value == nil {
@@ -128,26 +137,19 @@ func saveSliceProperty(props *[]Property, name string, noIndex bool, v reflect.V
 
 func (s structPLS) Save() ([]Property, error) {
 	var props []Property
-	if err := s.save(&props, "", false); err != nil {
+	if err := s.save(&props, false); err != nil {
 		return nil, err
 	}
 	return props, nil
 }
 
-func (s structPLS) save(props *[]Property, prefix string, noIndex bool) error {
-	for i, t := range s.codec.byIndex {
-		if t.name == "-" {
-			continue
-		}
-		name := t.name
-		if prefix != "" {
-			name = prefix + name
-		}
-		v := s.v.Field(i)
+func (s structPLS) save(props *[]Property, noIndex bool) error {
+	for name, f := range s.codec.fields {
+		v := s.v.FieldByIndex(f.path)
 		if !v.IsValid() || !v.CanSet() {
 			continue
 		}
-		noIndex1 := noIndex || t.noIndex
+		noIndex1 := noIndex || f.noIndex
 		if err := saveStructProperty(props, name, noIndex1, v); err != nil {
 			return err
 		}
@@ -233,6 +235,14 @@ func interfaceToProto(iv interface{}, noIndex bool) (*pb.Value, error) {
 			return nil, errors.New("[]byte property too long to index")
 		}
 		val.ValueType = &pb.Value_BlobValue{v}
+	case []Property:
+		e, err := propertiesToProto(nil, v)
+		if err != nil {
+			return nil, err
+		}
+		val.ValueType = &pb.Value_EntityValue{
+			EntityValue: e,
+		}
 	case []interface{}:
 		arr := make([]*pb.Value, 0, len(v))
 		for i, v := range v {

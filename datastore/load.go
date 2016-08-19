@@ -17,6 +17,7 @@ package datastore
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	pb "google.golang.org/genproto/googleapis/datastore/v1"
@@ -26,6 +27,7 @@ var (
 	typeOfByteSlice = reflect.TypeOf([]byte(nil))
 	typeOfTime      = reflect.TypeOf(time.Time{})
 	typeOfGeoPoint  = reflect.TypeOf(GeoPoint{})
+	typeOfKeyRef    = reflect.TypeOf(&Key{})
 )
 
 // typeMismatchReason returns a string explaining why the property p could not
@@ -77,42 +79,93 @@ func (l *propertyLoader) load(codec *structCodec, structValue reflect.Value, p P
 func (l *propertyLoader) loadOneElement(codec *structCodec, structValue reflect.Value, p Property, prev map[string]struct{}) string {
 	var sliceOk bool
 	var v reflect.Value
-	// Traverse a struct's struct-typed fields.
-	for name := p.Name; ; {
-		decoder, ok := codec.byName[name]
-		if !ok {
-			return "no such struct field"
-		}
-		v = structValue.Field(decoder.index)
+
+	// TODO: support multiple anonymous fields
+
+	name := p.Name
+	decoder, ok := codec.fields[name]
+	if ok {
+		v = initField(structValue, decoder.path)
 		if !v.IsValid() {
 			return "no such struct field"
 		}
 		if !v.CanSet() {
 			return "cannot set struct field"
 		}
+	} else {
+		// try for legacy nested field (named eg. "A.B.C")
+		//
+		// TODO: uncovered edge cases:
+		// 1. Given type:
+		//    type Foo struct {
+		//      A struct {
+		//        B struct {
+		//          C string
+		//        }
+		//      }
+		//
+		//      AA string `datastore:"A.B.C"`
+		//    }
+		//
+		//    If this type had been serialized in the old/legacy way,
+		//    we would have a duplicate key, "A.B.C". One for the value
+		//    of C, and one for the value of AA.
+		//    NOTE - this is also uncovered for the current implementation.
+		//
+		// 2. Given type:
+		//    type Foo struct {
+		//      A struct {
+		//        B string `datastore:"B.B"`
+		//      }
+		//    }
+		//    If this type had been serialized the old/legacy way,
+		//    the key would be, "A.B.B". Splitting on "." and assuming
+		//    each of "A", "B", "B" represented a nested struct field
+		//    would not work.
 
-		if decoder.substructCodec == nil {
-			break
+		fnames := strings.Split(p.Name, ".")
+		for i := 0; i < len(fnames); i++ {
+			var ok bool
+			name = fnames[i]
+			decoder, ok = codec.fields[name]
+			if !ok {
+				// try for anonymous field
+				decoder, ok = codec.fields[""]
+				// use same field name for next iteration
+				i--
+			}
+			if !ok {
+				return "no such struct field"
+			}
+			v = initField(structValue, decoder.path)
+			if !v.IsValid() {
+				return "no such struct field"
+			}
+			if !v.CanSet() {
+				return "cannot set struct field"
+			}
+
+			if decoder.structCodec != nil {
+				codec = decoder.structCodec
+				structValue = v
+			}
+		}
+	}
+
+	// If the element is a slice, we need to accommodate it.
+	var index int
+	if v.Kind() == reflect.Slice {
+		if l.m == nil {
+			l.m = make(map[string]int)
+		}
+		index = l.m[p.Name]
+		l.m[p.Name] = index + 1
+		for v.Len() <= index {
+			v.Set(reflect.Append(v, reflect.New(v.Type().Elem()).Elem()))
 		}
 
-		// If the element is a slice, we need to accommodate it.
-		if v.Kind() == reflect.Slice {
-			if l.m == nil {
-				l.m = make(map[string]int)
-			}
-			index := l.m[p.Name]
-			l.m[p.Name] = index + 1
-			for v.Len() <= index {
-				v.Set(reflect.Append(v, reflect.New(v.Type().Elem()).Elem()))
-			}
-			structValue = v.Index(index)
-			sliceOk = true
-		} else {
-			structValue = v
-		}
-		// Strip the "I." from "I.X".
-		name = name[len(codec.byIndex[decoder.index].name):]
-		codec = decoder.substructCodec
+		structValue = v.Index(index)
+		sliceOk = true
 	}
 
 	var slice reflect.Value
@@ -128,6 +181,23 @@ func (l *propertyLoader) loadOneElement(codec *structCodec, structValue reflect.
 
 	prev[p.Name] = struct{}{}
 
+	reason := setVal(p, v)
+	if reason != "" {
+		// set the slice back to its zero value
+		if slice.IsValid() {
+			slice.Set(reflect.Zero(slice.Type()))
+		}
+		return reason
+	}
+
+	if slice.IsValid() {
+		slice.Index(index).Set(v)
+	}
+
+	return ""
+}
+
+func setVal(p Property, v reflect.Value) string {
 	pValue := p.Value
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -161,14 +231,21 @@ func (l *propertyLoader) loadOneElement(codec *structCodec, structValue reflect.
 		}
 		v.SetFloat(x)
 	case reflect.Ptr:
-		x, ok := pValue.(*Key)
-		if !ok && pValue != nil {
-			return typeMismatchReason(p, v)
+		if v.Type() == typeOfKeyRef {
+			if _, ok := v.Interface().(*Key); !ok {
+				return typeMismatchReason(p, v)
+			}
+			if reflect.ValueOf(pValue).IsValid() {
+				v.Set(reflect.ValueOf(pValue))
+			}
+			break
 		}
-		if _, ok := v.Interface().(*Key); !ok {
-			return typeMismatchReason(p, v)
+		vEl := reflect.New(v.Type().Elem()).Elem()
+		reason := setVal(p, vEl)
+		if reason != "" {
+			return reason
 		}
-		v.Set(reflect.ValueOf(x))
+		v.Set(vEl.Addr())
 	case reflect.Struct:
 		switch v.Type() {
 		case typeOfTime:
@@ -184,7 +261,16 @@ func (l *propertyLoader) loadOneElement(codec *structCodec, structValue reflect.
 			}
 			v.Set(reflect.ValueOf(x))
 		default:
-			return typeMismatchReason(p, v)
+			if reflect.TypeOf(pValue) != reflect.TypeOf([]Property{}) {
+				return typeMismatchReason(p, v)
+			}
+			if !v.CanAddr() {
+				return "unsupported struct field: value is unaddressable"
+			}
+			err := LoadStruct(v.Addr().Interface(), pValue.([]Property))
+			if err != nil {
+				return err.Error()
+			}
 		}
 	case reflect.Slice:
 		x, ok := pValue.([]byte)
@@ -198,10 +284,22 @@ func (l *propertyLoader) loadOneElement(codec *structCodec, structValue reflect.
 	default:
 		return typeMismatchReason(p, v)
 	}
-	if slice.IsValid() {
-		slice.Set(reflect.Append(slice, v))
-	}
+
 	return ""
+}
+
+// TODO: comment
+func initField(val reflect.Value, index []int) reflect.Value {
+	for _, i := range index[:len(index)-1] {
+		val = val.Field(i)
+		if val.Kind() == reflect.Ptr {
+			if val.IsNil() {
+				val.Set(reflect.New(val.Type().Elem()))
+			}
+			val = val.Elem()
+		}
+	}
+	return val.Field(index[len(index)-1])
 }
 
 // loadEntity loads an EntityProto into PropertyLoadSaver or struct pointer.
@@ -274,8 +372,7 @@ func propToValue(v *pb.Value) interface{} {
 	case *pb.Value_GeoPointValue:
 		return GeoPoint{Lat: v.GeoPointValue.Latitude, Lng: v.GeoPointValue.Longitude}
 	case *pb.Value_EntityValue:
-		// TODO(djd): Support EntityValue.
-		return nil
+		return protoToProperties(v.EntityValue)
 	case *pb.Value_ArrayValue:
 		arr := make([]interface{}, 0, len(v.ArrayValue.Values))
 		for _, v := range v.ArrayValue.Values {
