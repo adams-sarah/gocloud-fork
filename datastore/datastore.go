@@ -209,7 +209,7 @@ func protoToKey(p *pb.Key) (*Key, error) {
 		}
 	}
 	if !key.valid() { // Also detects key == nil.
-		return nil, ErrInvalidKey
+		return key, ErrInvalidKey
 	}
 	return key, nil
 }
