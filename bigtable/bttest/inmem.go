@@ -77,7 +77,7 @@ type server struct {
 // NewServer creates a new Server.
 // The Server will be listening for gRPC connections, without TLS,
 // on the provided address. The resolved address is named by the Addr field.
-func NewServer(laddr string) (*Server, error) {
+func NewServer(laddr string, opt ...grpc.ServerOption) (*Server, error) {
 	l, err := net.Listen("tcp", laddr)
 	if err != nil {
 		return nil, err
@@ -86,7 +86,7 @@ func NewServer(laddr string) (*Server, error) {
 	s := &Server{
 		Addr: l.Addr().String(),
 		l:    l,
-		srv:  grpc.NewServer(),
+		srv:  grpc.NewServer(opt...),
 		s: &server{
 			tables: make(map[string]*table),
 		},
@@ -228,29 +228,34 @@ func (s *server) ReadRows(req *btpb.ReadRowsRequest, stream btpb.Bigtable_ReadRo
 	tbl.mu.RLock()
 
 	rowSet := make(map[string]*row)
-	// Add the explicitly given keys
-	for _, key := range req.Rows.RowKeys {
-		start := string(key)
-		addRows(start, start+"\x00", tbl, rowSet)
-	}
-
-	// Add keys from row ranges
-	for _, rr := range req.Rows.RowRanges {
-		var start, end string
-		switch sk := rr.StartKey.(type) {
-		case *btpb.RowRange_StartKeyClosed:
-			start = string(sk.StartKeyClosed)
-		case *btpb.RowRange_StartKeyOpen:
-			start = string(sk.StartKeyOpen) + "\x00"
-		}
-		switch ek := rr.EndKey.(type) {
-		case *btpb.RowRange_EndKeyClosed:
-			end = string(ek.EndKeyClosed) + "\x00"
-		case *btpb.RowRange_EndKeyOpen:
-			end = string(ek.EndKeyOpen)
+	if req.Rows != nil {
+		// Add the explicitly given keys
+		for _, key := range req.Rows.RowKeys {
+			start := string(key)
+			addRows(start, start + "\x00", tbl, rowSet)
 		}
 
-		addRows(start, end, tbl, rowSet)
+		// Add keys from row ranges
+		for _, rr := range req.Rows.RowRanges {
+			var start, end string
+			switch sk := rr.StartKey.(type) {
+			case *btpb.RowRange_StartKeyClosed:
+				start = string(sk.StartKeyClosed)
+			case *btpb.RowRange_StartKeyOpen:
+				start = string(sk.StartKeyOpen) + "\x00"
+			}
+			switch ek := rr.EndKey.(type) {
+			case *btpb.RowRange_EndKeyClosed:
+				end = string(ek.EndKeyClosed) + "\x00"
+			case *btpb.RowRange_EndKeyOpen:
+				end = string(ek.EndKeyOpen)
+			}
+
+			addRows(start, end, tbl, rowSet)
+		}
+	} else {
+		// Read all rows
+		addRows("", "", tbl, rowSet)
 	}
 	tbl.mu.RUnlock()
 
@@ -277,6 +282,9 @@ func addRows(start, end string, tbl *table, rowSet map[string]*row) {
 	if start != "" {
 		si = sort.Search(len(tbl.rows), func(i int) bool { return tbl.rows[i].key >= start })
 	}
+	// Types that are valid to be assigned to StartKey:
+	//	*RowRange_StartKeyClosed
+	//	*RowRange_StartKeyOpen
 	if end != "" {
 		ei = sort.Search(len(tbl.rows), func(i int) bool { return tbl.rows[i].key >= end })
 	}

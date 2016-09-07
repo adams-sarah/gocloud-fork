@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,12 +104,18 @@ func makeRequests(t *testing.T, req *http.Request, traceClient *trace.Client, rt
 		if err != nil {
 			t.Fatal(err)
 		}
-		bucketHandle := storageClient.Bucket("testbucket")
-		objectList, err := bucketHandle.List(ctx, nil)
-		if err != nil {
-			t.Fatal(err)
+		var objAttrsList []*storage.ObjectAttrs
+		it := storageClient.Bucket("testbucket").Objects(ctx, nil)
+		for {
+			objAttrs, err := it.Next()
+			if err != nil && err != storage.Done {
+				t.Fatal(err)
+			}
+			if err == storage.Done {
+				break
+			}
+			objAttrsList = append(objAttrsList, objAttrs)
 		}
-		_ = objectList
 	}
 
 	done := make(chan struct{})
@@ -192,7 +199,7 @@ func testTrace(t *testing.T, synchronous bool) {
 							"trace.cloud.google.com/http/host":        "www.googleapis.com",
 							"trace.cloud.google.com/http/method":      "GET",
 							"trace.cloud.google.com/http/status_code": "200",
-							"trace.cloud.google.com/http/url":         "https://www.googleapis.com/compute/v1/projects/testproject/zones?alt=json",
+							"trace.cloud.google.com/http/url":         "https://www.googleapis.com/compute/v1/projects/testproject/zones",
 						},
 						Name: "/compute/v1/projects/testproject/zones",
 					},
@@ -202,7 +209,7 @@ func testTrace(t *testing.T, synchronous bool) {
 							"trace.cloud.google.com/http/host":        "www.googleapis.com",
 							"trace.cloud.google.com/http/method":      "GET",
 							"trace.cloud.google.com/http/status_code": "200",
-							"trace.cloud.google.com/http/url":         "https://www.googleapis.com/storage/v1/b/testbucket/o?alt=json&delimiter=&maxResults=1000&pageToken=&prefix=&projection=full&versions=false",
+							"trace.cloud.google.com/http/url":         "https://www.googleapis.com/storage/v1/b/testbucket/o",
 						},
 						Name: "/storage/v1/b/testbucket/o",
 					},
@@ -270,6 +277,10 @@ func testTrace(t *testing.T, synchronous bool) {
 		for key, value := range *labels {
 			if v, ok := s.Labels[key]; !ok {
 				t.Errorf("Span %d is missing Label %q:%q", i, key, value)
+			} else if key == "trace.cloud.google.com/http/url" {
+				if !strings.HasPrefix(v, value) {
+					t.Errorf("Span %d Label %q: got value %q want prefix %q", i, key, v, value)
+				}
 			} else if v != value {
 				t.Errorf("Span %d Label %q: got value %q want %q", i, key, v, value)
 			}
@@ -325,4 +336,52 @@ func testNoTrace(t *testing.T, synchronous bool) {
 			t.Errorf("Got a trace, expected none.")
 		}
 	}
+}
+
+func TestSampling(t *testing.T) {
+	wg := sync.WaitGroup{}
+	type testCase struct {
+		rate          float64
+		maxqps        float64
+		expectedRange [2]int
+	}
+	for _, test := range []testCase{
+		{0, 5, [2]int{0, 0}},
+		{5, 0, [2]int{0, 0}},
+		{0.50, 100, [2]int{20, 60}},
+		{0.50, 1, [2]int{3, 3}},
+	} {
+		wg.Add(1)
+		go func(test testCase) {
+			rt := newFakeRoundTripper()
+			traceClient := newTestClient(rt)
+			p, err := trace.NewLimitedSampler(test.rate, test.maxqps)
+			if err != nil {
+				t.Fatalf("NewLimitedSampler: %v", err)
+			}
+			traceClient.SetSamplingPolicy(p)
+			ticker := time.NewTicker(25 * time.Millisecond)
+			sampled := 0
+			for i := 0; i < 79; i++ {
+				req, err := http.NewRequest("GET", "http://example.com/foo", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				span := traceClient.SpanFromRequest(req)
+				span.Finish()
+				select {
+				case <-rt.reqc:
+					<-ticker.C
+					sampled++
+				case <-ticker.C:
+				}
+			}
+			ticker.Stop()
+			if test.expectedRange[0] > sampled || sampled > test.expectedRange[1] {
+				t.Errorf("rate=%f, maxqps=%f: got %d samples want ∈ %v", test.rate, test.maxqps, sampled, test.expectedRange)
+			}
+			wg.Done()
+		}(test)
+	}
+	wg.Wait()
 }

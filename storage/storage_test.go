@@ -360,15 +360,15 @@ func TestCondition(t *testing.T) {
 		},
 		{
 			func() { obj.WithConditions(IfMetaGenerationNotMatch(1234)).Attrs(ctx) },
-			"GET https://www.googleapis.com/storage/v1/b/buck/o/obj?alt=json&ifMetagenerationNotMatch=1234&projection=full",
+			"GET /storage/v1/b/buck/o/obj?alt=json&ifMetagenerationNotMatch=1234&projection=full",
 		},
 		{
 			func() { obj.WithConditions(IfMetaGenerationMatch(1234)).Update(ctx, ObjectAttrs{}) },
-			"PATCH https://www.googleapis.com/storage/v1/b/buck/o/obj?alt=json&ifMetagenerationMatch=1234&projection=full",
+			"PATCH /storage/v1/b/buck/o/obj?alt=json&ifMetagenerationMatch=1234&projection=full",
 		},
 		{
 			func() { obj.WithConditions(Generation(1234)).Delete(ctx) },
-			"DELETE https://www.googleapis.com/storage/v1/b/buck/o/obj?alt=json&generation=1234",
+			"DELETE /storage/v1/b/buck/o/obj?alt=json&generation=1234",
 		},
 		{
 			func() {
@@ -376,13 +376,13 @@ func TestCondition(t *testing.T) {
 				w.ContentType = "text/plain"
 				w.Close()
 			},
-			"POST https://www.googleapis.com/upload/storage/v1/b/buck/o?alt=json&ifGenerationMatch=1234&projection=full&uploadType=multipart",
+			"POST /upload/storage/v1/b/buck/o?alt=json&ifGenerationMatch=1234&projection=full&uploadType=multipart",
 		},
 		{
 			func() {
 				obj.WithConditions(IfGenerationMatch(1234)).CopyTo(ctx, dst.WithConditions(IfMetaGenerationMatch(5678)), nil)
 			},
-			"POST https://www.googleapis.com/storage/v1/b/buck/o/obj/copyTo/b/dstbuck/o/dst?alt=json&ifMetagenerationMatch=5678&ifSourceGenerationMatch=1234&projection=full",
+			"POST /storage/v1/b/buck/o/obj/copyTo/b/dstbuck/o/dst?alt=json&ifMetagenerationMatch=5678&ifSourceGenerationMatch=1234&projection=full",
 		},
 	}
 
@@ -422,26 +422,24 @@ func TestEmptyObjectIterator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, f := range []func(*ObjectIterator) error{
-		func(it *ObjectIterator) error { _, err := it.Next(); return err },
-		func(it *ObjectIterator) error { _, _, err := it.NextPage(); return err },
-	} {
-		it := client.Bucket("b").Objects(ctx, nil)
-		c := make(chan error, 1)
-		go func() { c <- f(it) }()
-		select {
-		case err := <-c:
-			if err != Done {
-				t.Errorf("got %v, want Done", err)
-			}
-		case <-time.After(50 * time.Millisecond):
-			t.Errorf("%d: timed out", i)
+	it := client.Bucket("b").Objects(ctx, nil)
+	c := make(chan error, 1)
+	go func() {
+		_, err := it.Next()
+		c <- err
+	}()
+	select {
+	case err := <-c:
+		if err != Done {
+			t.Errorf("got %v, want Done", err)
 		}
+	case <-time.After(50 * time.Millisecond):
+		t.Error("timed out")
 	}
 }
 
-// Test that ObjectIterator's Next and NextPage methods correctly terminate
-// if there is nothing to iterate over.
+// Test that BucketIterator's Next method correctly terminates if there is
+// nothing to iterate over.
 func TestEmptyBucketIterator(t *testing.T) {
 	hClient, close := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(ioutil.Discard, r.Body)
@@ -453,21 +451,19 @@ func TestEmptyBucketIterator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, f := range []func(*BucketIterator) error{
-		func(it *BucketIterator) error { _, err := it.Next(); return err },
-		func(it *BucketIterator) error { _, err := it.NextPage(); return err },
-	} {
-		it := client.Buckets(ctx, "project")
-		c := make(chan error, 1)
-		go func() { c <- f(it) }()
-		select {
-		case err := <-c:
-			if err != Done {
-				t.Errorf("got %v, want Done", err)
-			}
-		case <-time.After(50 * time.Millisecond):
-			t.Errorf("%d: timed out", i)
+	it := client.Buckets(ctx, "project")
+	c := make(chan error, 1)
+	go func() {
+		_, err := it.Next()
+		c <- err
+	}()
+	select {
+	case err := <-c:
+		if err != Done {
+			t.Errorf("got %v, want Done", err)
 		}
+	case <-time.After(50 * time.Millisecond):
+		t.Error("timed out")
 	}
 }
 
