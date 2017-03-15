@@ -749,6 +749,12 @@ func TestKeyLoader(t *testing.T) {
 		}
 
 		if !reflect.DeepEqual(tc.want, tc.dst) {
+			// log.Println(*tc.dst.(*NestedKeyLoaders).Two)
+			// for _, k := range tc.dst.(*NestedKeyLoaders).Three {
+			// 	log.Println(*k)
+			// }
+			// log.Println(*tc.dst.(*NestedKeyLoaders).Four)
+			// log.Println(*tc.dst.(*NestedKeyLoaders).PLS)
 			t.Errorf("%s: compare:\ngot:  %#v\nwant: %#v", tc.desc, tc.dst, tc.want)
 		}
 	}

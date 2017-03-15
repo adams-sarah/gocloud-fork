@@ -90,6 +90,7 @@ func (l *propertyLoader) loadOneElement(codec fields.List, structValue reflect.V
 
 	name := p.Name
 	fieldNames := strings.Split(name, ".")
+	flattened := len(fieldNames) > 1
 
 	for len(fieldNames) > 0 {
 		var field *fields.Field
@@ -123,6 +124,27 @@ func (l *propertyLoader) loadOneElement(codec fields.List, structValue reflect.V
 			return "cannot set struct field"
 		}
 
+		// If field implements PLS and it has been flattened, we must
+		// delegate loading back to the PLS early, and stop iterating through
+		// fields.
+		// For example, say our original field name was "A.B.C.D",
+		// and at this point in iteration we have initialized the field
+		// corresponding to "A" and have moved into the struct, so that now
+		// field.Name == "B".
+		// We want to let the PLS handle this field (B) and all its subfields,
+		// so we defer to the PLS's Load method, and send the property,
+		// renamed to "B.C.D".
+		if flattened {
+			ok, err := plsLoad(v, p, fieldNames)
+			if err != nil {
+				return err.Error()
+			}
+			if ok {
+				return ""
+			}
+		}
+		// END - FLATTENED, IS FIELD A PLS?
+
 		var err error
 		if field.Type.Kind() == reflect.Struct {
 			codec, err = structCache.Fields(field.Type)
@@ -143,6 +165,30 @@ func (l *propertyLoader) loadOneElement(codec fields.List, structValue reflect.V
 				v.Set(reflect.Append(v, reflect.New(v.Type().Elem()).Elem()))
 			}
 			structValue = v.Index(sliceIndex)
+			// BEGIN - FLATTENED, IS FIELD A PLS?
+			if flattened {
+				vpls, errStr := pls(structValue)
+				if errStr != "" {
+					return errStr
+				}
+
+				// TODO: comment about flattened
+				if vpls != nil {
+					// TODO: fix comment
+					// If field implements PLS, we delegate loading back to the PLS.
+					// For example, if our original field name was "A.B.C.D",
+					// and at this point in iteration,field.Name == "B",
+					// we want to let the PLS handle this field and all subfields.
+					// Thus, the property name to send to Load becomes "B.C.D".
+					p.Name = strings.Join(fieldNames, ".")
+					err := vpls.Load([]Property{p})
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}
+			}
+			// END - FLATTENED, IS FIELD A PLS?
 			if structValue.Type().Kind() == reflect.Struct {
 				codec, err = structCache.Fields(structValue.Type())
 				if err != nil {
@@ -181,10 +227,39 @@ func (l *propertyLoader) loadOneElement(codec fields.List, structValue reflect.V
 	return ""
 }
 
+// TODO: what about KeyLoaders?
+// plsLoad first tries to converts v's value to a PLS, then v's addressed
+// value to a PLS. If neither succeeds, plsLoad returns false for first return
+// value. Otherwise, the first return value will be true.
+// If v is successfully converted to a PLS, plsLoad will then try to Load
+// the property p into v (by way of the PLS).
+func plsLoad(v reflect.Value, p Property, subfields []string) (ok bool, err error) {
+	if vpls, ok = v.Interface().(PropertyLoadSaver); ok {
+		if v.Type().Kind() == reflect.Struct {
+			// TODO: error message is repeated code
+			return false, fmt.Errorf("datastore: PropertyLoadSaver methods must be implemented on a pointer to %T.", v.Interface())
+		}
+
+		if v.Type().Kind() == reflect.Ptr && v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+			vpls = v.Interface().(PropertyLoadSaver)
+		}
+	} else {
+		vpls, ok = v.Addr().Interface().(PropertyLoadSaver)
+	}
+
+	if !ok {
+		return false, nil
+	}
+
+	p.Name = strings.Join(fieldNames, ".")
+	err = vpls.Load([]Property{p})
+	return ok, err
+}
+
 // setVal sets 'v' to the value of the Property 'p'.
 func setVal(v reflect.Value, p Property) string {
 	pValue := p.Value
-
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		x, ok := pValue.(int64)
@@ -263,16 +338,14 @@ func setVal(v reflect.Value, p Property) string {
 			}
 			v.Set(reflect.ValueOf(x))
 		default:
+			// TODO: repeated code
+			if _, ok := v.Interface().(PropertyLoadSaver); ok {
+				return fmt.Sprintf("datastore: PropertyLoadSaver methods must be implemented on a pointer to %T.", v.Interface())
+			}
 			ent, ok := pValue.(*Entity)
 			if !ok {
 				return typeMismatchReason(p, v)
 			}
-
-			// Check if v implements PropertyLoadSaver.
-			if _, ok := v.Interface().(PropertyLoadSaver); ok {
-				return fmt.Sprintf("datastore: PropertyLoadSaver methods must be implemented on a pointer to %T.", v.Interface())
-			}
-
 			err := loadEntity(v.Addr().Interface(), ent)
 			if err != nil {
 				return err.Error()
